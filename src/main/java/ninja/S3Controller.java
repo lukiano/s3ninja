@@ -9,13 +9,9 @@
 package ninja;
 
 import com.google.common.base.Charsets;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-import com.google.common.hash.HashCode;
 import com.google.common.hash.Hashing;
 import com.google.common.io.BaseEncoding;
 import com.google.common.io.ByteStreams;
-import com.google.common.io.Files;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
@@ -35,17 +31,17 @@ import sirius.web.security.UserContext;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
 import java.time.ZoneOffset;
 import java.time.chrono.IsoChronology;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -69,8 +65,6 @@ public class S3Controller implements Controller {
 
     @Part
     private APILog log;
-
-    private Map<String, ReentrantLock> locks = Maps.newConcurrentMap();
 
     /*
      * Computes the expected hash for the given request.
@@ -103,20 +97,10 @@ public class S3Controller implements Controller {
                                             .asString(ctx.getHeaderValue("Date").asString(""))));
         stringToSign.append("\n");
 
-        List<String> headers = Lists.newArrayList();
-        for (String name : ctx.getRequest().headers().names()) {
-            if (name.toLowerCase().startsWith("x-amz-") && !"x-amz-date".equals(name.toLowerCase())) {
-                StringBuilder headerBuilder = new StringBuilder(name.toLowerCase().trim());
-                headerBuilder.append(":");
-                headerBuilder.append(Strings.join(ctx.getRequest().headers().getAll(name), ",").trim());
-                headers.add(headerBuilder.toString());
-            }
-        }
-        Collections.sort(headers);
-        for (String header : headers) {
-            stringToSign.append(header);
-            stringToSign.append("\n");
-        }
+        ctx.getRequest().headers().names().stream()
+            .map(String::toLowerCase).filter(n -> n.startsWith("x-amz-") && !"x-amz-date".equals(n))
+            .sorted().map(n -> n + ":" + Strings.join(ctx.getRequest().headers().getAll(n), ",") + "\n")
+            .forEach(stringToSign::append);
 
         stringToSign.append(pathPrefix).append(ctx.getRequest().getUri().substring(3));
 
@@ -315,51 +299,40 @@ public class S3Controller implements Controller {
      */
     private void putObject(WebContext ctx, Bucket bucket, String id) throws Exception {
         StoredObject object = bucket.getObject(id);
-        InputStream inputStream = ctx.getContent();
-        if (inputStream == null) {
+        InputStream in = ctx.getContent();
+        if (in == null) {
             signalObjectError(ctx, HttpResponseStatus.BAD_REQUEST, "No content posted");
             return;
         }
         try {
-            FileOutputStream out = new FileOutputStream(object.getFile());
-            try {
-                ByteStreams.copy(inputStream, out);
-            } finally {
-                out.close();
+            try (OutputStream out = Files.newOutputStream(object.getPath())) {
+                ByteStreams.copy(in, out);
             }
         } finally {
-            inputStream.close();
+            in.close();
         }
 
-        Map<String, String> properties = Maps.newTreeMap();
-        for (String name : ctx.getRequest().headers().names()) {
-            String nameLower = name.toLowerCase();
-            if (nameLower.startsWith("x-amz-meta-") || nameLower.equals("content-md5") || nameLower.equals(
-                    "content-type") || nameLower.equals("x-amz-acl")) {
-                properties.put(name, ctx.getHeader(name));
-            }
-        }
-        HashCode hash = Files.hash(object.getFile(), Hashing.md5());
-        String md5 = BaseEncoding.base64().encode(hash.asBytes());
+        Map<String, String> properties = ctx.getRequest().headers().names().stream()
+                .map(String::toLowerCase)
+                .filter(n -> n.startsWith("x-amz-meta-") || n.equals("content-md5") || n.equals("content-type") || n.equals("x-amz-acl"))
+                .sorted().collect(Collectors.toMap(Function.<String>identity(), ctx::getHeader));
+
+        Util.MD5 md5 = Util.md5(object.getPath());
         if (properties.containsKey("Content-MD5")) {
-            if (!md5.equals(properties.get("Content-MD5"))) {
+            if (!md5.base64().equals(properties.get("Content-MD5"))) {
                 object.delete();
                 signalObjectError(ctx,
-                                  HttpResponseStatus.BAD_REQUEST,
-                                  Strings.apply("Invalid MD5 checksum (Input: %s, Expected: %s)",
-                                                properties.get("Content-MD5"),
-                                                md5));
+                    HttpResponseStatus.BAD_REQUEST,
+                    Strings.apply("Invalid MD5 checksum (Input: %s, Expected: %s)",
+                            properties.get("Content-MD5"),
+                            md5.base64()));
                 return;
             }
         }
 
         object.storeProperties(properties);
-        ctx.respondWith().addHeader(HttpHeaders.Names.ETAG, etag(hash)).status(HttpResponseStatus.OK);
+        ctx.respondWith().addHeader(HttpHeaders.Names.ETAG, md5.etag()).status(HttpResponseStatus.OK);
         signalObjectSuccess(ctx);
-    }
-
-    private String etag(HashCode hash) {
-        return "\"" + hash + "\"";
     }
 
     private DateTimeFormatter dateTimeFormatter =
@@ -375,18 +348,14 @@ public class S3Controller implements Controller {
      */
     private void copyObject(WebContext ctx, Bucket bucket, String id, String copy) throws IOException {
         StoredObject object = bucket.getObject(id);
-        /*
-        if (!object.exists()) {
-            signalObjectError(ctx, HttpResponseStatus.NOT_FOUND, "Object does not exist");
-            return;
-        }
-        */
         if (!copy.contains("/")) {
             signalObjectError(ctx, HttpResponseStatus.BAD_REQUEST, "Source must contain '/'");
             return;
         }
-        String srcBucketName = copy.substring(1, copy.lastIndexOf("/"));
-        String srcId = copy.substring(copy.lastIndexOf("/") + 1);
+        String noRoot = copy.substring(1);
+        int indexSlash = noRoot.indexOf("/");
+        String srcBucketName = noRoot.substring(0, indexSlash);
+        String srcId = noRoot.substring(indexSlash + 1).replace('/', '_');
         Bucket srcBucket = storage.getBucket(srcBucketName);
         if (!srcBucket.exists()) {
             signalObjectError(ctx, HttpResponseStatus.BAD_REQUEST, "Source bucket does not exist");
@@ -397,19 +366,18 @@ public class S3Controller implements Controller {
             signalObjectError(ctx, HttpResponseStatus.BAD_REQUEST, "Source object does not exist");
             return;
         }
-        Files.copy(src.getFile(), object.getFile());
-        if (src.getPropertiesFile().exists()) {
-            Files.copy(src.getPropertiesFile(), object.getPropertiesFile());
+        Files.copy(src.getPath(), object.getPath());
+        if (Files.exists(src.getPropertiesPath())) {
+            Files.copy(src.getPropertiesPath(), object.getPropertiesPath());
         }
-        HashCode hash = Files.hash(object.getFile(), Hashing.md5());
-        String etag = etag(hash);
-        XMLStructuredOutput structuredOutput = ctx.respondWith().addHeader(HttpHeaders.Names.ETAG, etag).xml();
+        Util.MD5 md5 = Util.md5(object.getPath());
+        XMLStructuredOutput structuredOutput = ctx.respondWith().addHeader(HttpHeaders.Names.ETAG, md5.etag()).xml();
         structuredOutput.beginOutput("CopyObjectResult");
         structuredOutput.beginObject("LastModified");
         structuredOutput.text(dateTimeFormatter.format(object.getLastModifiedInstant()));
         structuredOutput.endObject();
         structuredOutput.beginObject("ETag");
-        structuredOutput.text(etag);
+        structuredOutput.text(md5.etag());
         structuredOutput.endObject();
         structuredOutput.endOutput();
         signalObjectSuccess(ctx);
@@ -429,11 +397,10 @@ public class S3Controller implements Controller {
             return;
         }
         Response response = ctx.respondWith();
-        for (Map.Entry<Object, Object> entry : object.getProperties()) {
-            response.addHeader(entry.getKey().toString(), entry.getValue().toString());
-        }
+        object.getProperties().forEach(response::addHeader);
+        response.addHeader(HttpHeaders.Names.CONTENT_LENGTH, String.valueOf(Files.size(object.getPath())));
         if (sendFile) {
-            response.file(object.getFile());
+            response.file(object.getPath().toFile());
         } else {
             response.status(HttpResponseStatus.OK);
         }

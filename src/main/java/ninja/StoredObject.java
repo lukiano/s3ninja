@@ -8,16 +8,19 @@
 
 package ninja;
 
+import sirius.kernel.health.Exceptions;
 import sirius.kernel.nls.NLS;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Properties;
-import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Represents a stored object.
@@ -26,15 +29,15 @@ import java.util.Set;
  * @since 2013/08
  */
 public class StoredObject {
-    private File file;
+    private final Path path;
 
     /**
      * Creates a new StoredObject based on a file.
      *
-     * @param file the contents of the object.
+     * @param path the contents of the object.
      */
-    public StoredObject(File file) {
-        this.file = file;
+    public StoredObject(Path path) {
+        this.path = path;
     }
 
     /**
@@ -43,7 +46,7 @@ public class StoredObject {
      * @return the name of the object
      */
     public String getName() {
-        return file.getName();
+        return path.getFileName().toString();
     }
 
     /**
@@ -52,7 +55,11 @@ public class StoredObject {
      * @return a string representation of the byte-size of the object
      */
     public String getSize() {
-        return NLS.formatSize(file.length());
+        try {
+            return NLS.formatSize(Files.size(path));
+        } catch (IOException e) {
+            throw Exceptions.handle(Storage.LOG, e);
+        }
     }
 
     /**
@@ -65,15 +72,23 @@ public class StoredObject {
     }
 
     public Instant getLastModifiedInstant() {
-        return Instant.ofEpochMilli(file.lastModified());
+        try {
+            return Files.getLastModifiedTime(path).toInstant();
+        } catch (IOException e) {
+            throw Exceptions.handle(Storage.LOG, e);
+        }
     }
 
     /**
      * Deletes the object
      */
     public void delete() {
-        file.delete();
-        getPropertiesFile().delete();
+      try {
+        Files.delete(path);
+        Files.delete(getPropertiesPath());
+      } catch (IOException e) {
+        throw Exceptions.handle(Storage.LOG, e);
+      }
     }
 
     /**
@@ -81,17 +96,17 @@ public class StoredObject {
      *
      * @return the underlying file containing the stored contents
      */
-    public File getFile() {
-        return file;
+    public Path getPath() {
+        return path;
     }
 
     /**
-     * Determins if the object exists
+     * Determines if the object exists
      *
      * @return <tt>true</tt> if the object exists, <tt>false</tt> otherwise
      */
     public boolean exists() {
-        return file.exists();
+        return Files.exists(path);
     }
 
     /**
@@ -103,16 +118,12 @@ public class StoredObject {
      * @return a set of name value pairs representing all properties stored for this object
      * @throws Exception in case of an IO error
      */
-    public Set<Map.Entry<Object, Object>> getProperties() throws Exception {
+    public Map<String, String> getProperties() throws Exception {
         Properties props = new Properties();
-        FileInputStream in = new FileInputStream(getPropertiesFile());
-        try {
-            props.load(in);
-        } finally {
-            in.close();
+        try (InputStream in = Files.newInputStream(getPropertiesPath())) {
+          props.load(in);
         }
-
-        return props.entrySet();
+        return props.stringPropertyNames().stream().collect(Collectors.toMap(Function.<String>identity(), props::getProperty));
     }
 
     /**
@@ -120,8 +131,8 @@ public class StoredObject {
      *
      * @return the underlying file used to store the meta infos
      */
-    public File getPropertiesFile() {
-        return new File(file.getParentFile(), "__ninja_" + file.getName() + ".properties");
+    public Path getPropertiesPath() {
+        return path.resolveSibling("__ninja_" + path.getFileName().toString() + ".properties");
     }
 
     /**
@@ -133,11 +144,8 @@ public class StoredObject {
     public void storeProperties(Map<String, String> properties) throws IOException {
         Properties props = new Properties();
         props.putAll(properties);
-        FileOutputStream out = new FileOutputStream(getPropertiesFile());
-        try {
-            props.store(out, "");
-        } finally {
-            out.close();
+        try (OutputStream out = Files.newOutputStream(getPropertiesPath())) {
+          props.store(out, "");
         }
     }
 }

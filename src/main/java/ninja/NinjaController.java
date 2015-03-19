@@ -9,11 +9,7 @@
 package ninja;
 
 import com.google.common.collect.Maps;
-import com.google.common.hash.HashCode;
-import com.google.common.hash.Hashing;
-import com.google.common.io.BaseEncoding;
 import com.google.common.io.ByteStreams;
-import com.google.common.io.Files;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import sirius.kernel.commons.PriorityCollector;
@@ -29,9 +25,10 @@ import sirius.web.http.Response;
 import sirius.web.http.WebContext;
 import sirius.web.security.UserContext;
 
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -125,12 +122,12 @@ public class NinjaController implements Controller {
         }
         ctx.respondWith()
            .template("view/log.html",
-                     entries,
-                     canPagePrev,
-                     canPageNext,
-                     (start + 1) + " - " + (start + entries.size()),
-                     Math.max(1, start - pageSize + 1),
-                     start + pageSize + 1);
+                   entries,
+                   canPagePrev,
+                   canPageNext,
+                   (start + 1) + " - " + (start + entries.size()),
+                   Math.max(1, start - pageSize + 1),
+                   start + pageSize + 1);
     }
 
     /**
@@ -172,10 +169,8 @@ public class NinjaController implements Controller {
                 return;
             }
             Response response = ctx.respondWith();
-            for (Map.Entry<Object, Object> entry : object.getProperties()) {
-                response.addHeader(entry.getKey().toString(), entry.getValue().toString());
-            }
-            response.file(object.getFile());
+            object.getProperties().forEach(response::addHeader);
+            response.file(object.getPath().toFile());
         } catch (Exception e) {
             ctx.respondWith().error(HttpResponseStatus.BAD_REQUEST, Exceptions.handle(UserContext.LOG, e));
         }
@@ -193,24 +188,14 @@ public class NinjaController implements Controller {
             String name = ctx.get("filename").asString(ctx.get("qqfile").asString());
             Bucket storageBucket = storage.getBucket(bucket);
             StoredObject object = storageBucket.getObject(name);
-            InputStream inputStream = ctx.getContent();
-            try {
-                FileOutputStream out = new FileOutputStream(object.getFile());
-                try {
-                    ByteStreams.copy(inputStream, out);
-                } finally {
-                    out.close();
-                }
-            } finally {
-                inputStream.close();
+            try (InputStream in = ctx.getContent(); OutputStream out = Files.newOutputStream(object.getPath())) {
+              ByteStreams.copy(in, out);
             }
 
             Map<String, String> properties = Maps.newTreeMap();
             properties.put(HttpHeaders.Names.CONTENT_TYPE,
                            ctx.getHeaderValue(HttpHeaders.Names.CONTENT_TYPE).asString(MimeHelper.guessMimeType(name)));
-            HashCode hash = Files.hash(object.getFile(), Hashing.md5());
-            String md5 = BaseEncoding.base64().encode(hash.asBytes());
-            properties.put("Content-MD5", md5);
+            properties.put("Content-MD5", Util.md5(object.getPath()).base64());
             object.storeProperties(properties);
 
             ctx.respondWith().direct(HttpResponseStatus.OK, "{ success: true }");

@@ -8,7 +8,6 @@
 
 package ninja;
 
-import com.google.common.collect.Lists;
 import sirius.kernel.Sirius;
 import sirius.kernel.di.std.ConfigValue;
 import sirius.kernel.di.std.Register;
@@ -16,8 +15,15 @@ import sirius.kernel.health.Exceptions;
 import sirius.kernel.health.Log;
 import sirius.kernel.nls.NLS;
 
-import java.io.File;
+import java.io.IOException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 /**
  * Storage service which takes care of organizing buckets on disk.
@@ -28,7 +34,7 @@ import java.util.List;
 @Register(classes = Storage.class)
 public class Storage {
 
-    private File baseDir;
+    private Path baseDir;
     protected static final Log LOG = Log.get("storage");
 
     @ConfigValue("storage.awsAccessKey")
@@ -40,32 +46,36 @@ public class Storage {
     @ConfigValue("storage.autocreateBuckets")
     private boolean autocreateBuckets;
 
-    protected File getBaseDir() {
+    protected Path getBaseDir() {
         baseDir = getBaseDirUnchecked();
 
-        if (!baseDir.exists()) {
+        if (!Files.exists(baseDir)) {
             throw Exceptions.handle()
                             .to(LOG)
-                            .withSystemErrorMessage("Basedir '%s' does not exist!", baseDir.getAbsolutePath())
+                            .withSystemErrorMessage("Basedir '%s' does not exist!", baseDir.toAbsolutePath())
                             .handle();
         }
-        if (!baseDir.isDirectory()) {
+        if (!Files.isDirectory(baseDir)) {
             throw Exceptions.handle()
                             .to(LOG)
-                            .withSystemErrorMessage("Basedir '%s' is not a directory!", baseDir.getAbsolutePath())
+                            .withSystemErrorMessage("Basedir '%s' is not a directory!", baseDir.toAbsolutePath())
                             .handle();
         }
 
         return baseDir;
     }
 
-    private File getBaseDirUnchecked() {
+    private Path getBaseDirUnchecked() {
         if (baseDir == null) {
             if (Sirius.isStartedAsTest()) {
-                baseDir = new File(System.getProperty("java.io.tmpdir"), "s3ninja_test");
-                baseDir.mkdirs();
+                baseDir = Paths.get(System.getProperty("java.io.tmpdir"), "s3ninja_test");
+              try {
+                Files.createDirectories(baseDir);
+              } catch (IOException e) {
+                throw Exceptions.handle(Storage.LOG, e);
+              }
             } else {
-                baseDir = new File(Sirius.getConfig().getString("storage.baseDir"));
+                baseDir = Paths.get(Sirius.getConfig().getString("storage.baseDir"));
             }
         }
 
@@ -79,16 +89,26 @@ public class Storage {
      * not usable
      */
     public String getBasePath() {
-        StringBuilder sb = new StringBuilder(getBaseDirUnchecked().getAbsolutePath());
-        if (!getBaseDirUnchecked().exists()) {
+        StringBuilder sb = new StringBuilder(getBaseDirUnchecked().toString());
+        if (!Files.exists(getBaseDirUnchecked())) {
             sb.append(" (non-existent!)");
-        } else if (!getBaseDirUnchecked().isDirectory()) {
+        } else if (!Files.isDirectory(getBaseDirUnchecked())) {
             sb.append(" (no directory!)");
         } else {
-            sb.append(" (Free: " + NLS.formatSize(getBaseDir().getFreeSpace()) + ")");
+            sb.append(" (Free: ");
+            sb.append(NLS.formatSize(getFreeSpace(getBaseDir())));
+            sb.append(")");
         }
 
         return sb.toString();
+    }
+
+    public long getFreeSpace(Path path) {
+      try {
+        return Files.getFileStore(path).getUsableSpace();
+      } catch (IOException e) {
+        throw Exceptions.handle(Storage.LOG, e);
+      }
     }
 
     /**
@@ -97,14 +117,11 @@ public class Storage {
      * @return a list of all known buckets
      */
     public List<Bucket> getBuckets() {
-        List<Bucket> result = Lists.newArrayList();
-        for (File file : getBaseDir().listFiles()) {
-            if (file.isDirectory()) {
-                result.add(new Bucket(file));
-            }
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(getBaseDir(), Files::isDirectory)) {
+          return StreamSupport.stream(ds.spliterator(), false).map(Bucket::new).collect(Collectors.toList());
+        } catch (IOException e) {
+          return Collections.emptyList();
         }
-
-        return result;
     }
 
     /**
@@ -121,7 +138,7 @@ public class Storage {
                                     bucket)
                             .handle();
         }
-        return new Bucket(new File(getBaseDir(), bucket));
+        return new Bucket(getBaseDir().resolve(bucket));
     }
 
     /**

@@ -8,7 +8,6 @@
 
 package ninja;
 
-import com.google.common.collect.Lists;
 import sirius.kernel.cache.Cache;
 import sirius.kernel.cache.CacheManager;
 import sirius.kernel.cache.ValueComputer;
@@ -16,10 +15,17 @@ import sirius.kernel.health.Exceptions;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 /**
  * Represents a bucket.
@@ -32,17 +38,17 @@ import java.util.List;
  */
 public class Bucket {
 
-    private File file;
-    private static Cache<String, Boolean> publicAccessCache = CacheManager.createCache("public-bucket-access");
+    private final Path path;
+    private static final Cache<String, Boolean> publicAccessCache = CacheManager.createCache("public-bucket-access");
 
 
     /**
      * Creates a new bucket based on the given directory.
      *
-     * @param file the directory which stores the contents of the bucket.
+     * @param path the directory which stores the contents of the bucket.
      */
-    public Bucket(File file) {
-        this.file = file;
+    public Bucket(Path path) {
+        this.path = path;
     }
 
     /**
@@ -51,18 +57,58 @@ public class Bucket {
      * @return the name of the bucket
      */
     public String getName() {
-        return file.getName();
+        return path.getFileName().toString();
     }
 
     /**
      * Deletes the bucket and all of its contents.
      */
     public void delete() {
-        for (File child : file.listFiles()) {
-            child.delete();
-        }
-        file.delete();
+      try {
+        removeRecursive(path);
+      } catch (IOException e) {
+        throw Exceptions.handle(Storage.LOG, e);
+      }
     }
+
+  public static void removeRecursive(Path path) throws IOException
+  {
+    Files.walkFileTree(path, new SimpleFileVisitor<Path>()
+    {
+      @Override
+      public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+              throws IOException
+      {
+        Files.delete(file);
+        return FileVisitResult.CONTINUE;
+      }
+
+      @Override
+      public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException
+      {
+        // try to delete the file anyway, even if its attributes
+        // could not be read, since delete-only access is
+        // theoretically possible
+        Files.delete(file);
+        return FileVisitResult.CONTINUE;
+      }
+
+      @Override
+      public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException
+      {
+        if (exc == null)
+        {
+          Files.delete(dir);
+          return FileVisitResult.CONTINUE;
+        }
+        else
+        {
+          // directory iteration failed; propagate exception
+          throw exc;
+        }
+      }
+    });
+  }
 
     /**
      * Creates the bucket.
@@ -71,26 +117,32 @@ public class Bucket {
      * </p>
      */
     public void create() {
-        if (!file.exists()) {
-            file.mkdirs();
+        if (Files.notExists(path)) {
+          try {
+            Files.createDirectories(path);
+          } catch (IOException e) {
+            throw Exceptions.handle(Storage.LOG, e);
+          }
         }
     }
 
-    /**
-     * Returns a list of all stored objects
-     *
-     * @return a list of all objects in the bucket.
-     */
-    public List<StoredObject> getObjects() {
-        List<StoredObject> result = Lists.newArrayList();
-        for (File child : file.listFiles()) {
-            if (child.isFile() && !child.getName().startsWith("__")) {
-                result.add(new StoredObject(child));
-            }
+      /**
+       * Returns a list of all stored objects
+       *
+       * @return a list of all objects in the bucket.
+       */
+      public List<StoredObject> getObjects() {
+        try (DirectoryStream<Path> ds =
+                     Files.newDirectoryStream(path, f -> Files.isRegularFile(f) && !isMetadata(f))) {
+          return StreamSupport.stream(ds.spliterator(), false).map(StoredObject::new).collect(Collectors.toList());
+        } catch (IOException e) {
+          return Collections.emptyList();
         }
+      }
 
-        return result;
-    }
+      private boolean isMetadata(Path path) {
+        return path.getFileName().toString().startsWith("__");
+      }
 
     /**
      * Determines if the bucket is private or public accessible
@@ -98,26 +150,31 @@ public class Bucket {
      * @return <tt>true</tt> if the bucket is public accessible, <tt>false</tt> otherwise
      */
     public boolean isPrivate() {
-        return !publicAccessCache.get(getName(), new ValueComputer<String, Boolean>() {
-            @Nullable
-            @Override
-            public Boolean compute(@Nonnull String key) {
-                return getPublicMarkerFile().exists();
-            }
-        });
+      Boolean result = publicAccessCache.get(getName(), new ValueComputer<String, Boolean>() {
+        @Nullable
+        @Override
+        public Boolean compute(@Nonnull String key) {
+          return Files.exists(getPublicMarkerFile());
+        }
+      });
+      return result != null && !result;
     }
 
-    private File getPublicMarkerFile() {
-        return new File(file, "__ninja_public");
+    private Path getPublicMarkerFile() {
+        return path.resolve("__ninja_public");
     }
 
     /**
      * Marks the bucket as private accessible.
      */
     public void makePrivate() {
-        if (getPublicMarkerFile().exists()) {
-            getPublicMarkerFile().delete();
-            publicAccessCache.put(getName(), false);
+        if (Files.exists(getPublicMarkerFile())) {
+          try {
+            Files.delete(getPublicMarkerFile());
+          } catch (IOException e) {
+            throw Exceptions.handle(Storage.LOG, e);
+          }
+          publicAccessCache.put(getName(), false);
         }
     }
 
@@ -125,9 +182,9 @@ public class Bucket {
      * Marks the bucket as public accessible.
      */
     public void makePublic() {
-        if (!getPublicMarkerFile().exists()) {
+        if (!Files.exists(getPublicMarkerFile())) {
             try {
-                new FileOutputStream(getPublicMarkerFile()).close();
+                Files.createFile(getPublicMarkerFile());
             } catch (IOException e) {
                 throw Exceptions.handle(Storage.LOG, e);
             }
@@ -140,8 +197,8 @@ public class Bucket {
      *
      * @return a <tt>File</tt> representing the underlying directory
      */
-    public File getFile() {
-        return file;
+    public Path getPath() {
+        return path;
     }
 
     /**
@@ -150,7 +207,7 @@ public class Bucket {
      * @return <tt>true</tt> if the bucket exists, <tt>false</tt> otherwise
      */
     public boolean exists() {
-        return file.exists();
+        return Files.exists(path);
     }
 
     /**
@@ -163,10 +220,11 @@ public class Bucket {
         if (id.contains("..") || id.contains("/") || id.contains("\\")) {
             throw Exceptions.createHandled()
                             .withSystemErrorMessage(
-                                    "Invalid object name: %s. A object name must not contain '..' '/' or '\\'",
+                                    "Invalid object name: %s. A object name must not contain '..', '/' or '\\'",
                                     id)
                             .handle();
         }
-        return new StoredObject(new File(file, id));
+      Path object = path.resolve(id);
+      return new StoredObject(object);
     }
 }
